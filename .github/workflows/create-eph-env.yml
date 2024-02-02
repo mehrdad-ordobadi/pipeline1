@@ -1,0 +1,68 @@
+name: Create Ephemeral Environment
+on:
+  repository_dispatch:
+    types: [launch-ephemeral-environment] # can add client payload for inputs etc - can change the type name in the future
+
+env:
+  AWS_REGION: us-east-1
+  TF_ENV: "dev"  
+  # AWS_ACCOUNT_ID --> can add account ID here as env variable it is to be hardcoded - best if used as secret though   
+
+jobs:
+    create-ephemeral-environment:
+        runs-on: ubuntu-latest
+        steps:
+            - name: checkout-code
+              uses: actions/checkout@v2
+              
+            - name: Configure Aws credentials
+              uses: aws-actions/configure-aws-credentials@v4 #v4 the lastest version
+              with:
+               aws-region: ${{ env.AWS_REGION }}
+               role-to-assume: arn:aws:iam::AWS_ACCOUNT_ID:role/IAM_ROLE # what is the AWS_ACCOUNT_ID - check role name
+               # look into session tagging. is it necessary in our case?
+
+            - name: create-ecr-repository # if we are using a single ecr -> this step could be done manually once insead of in the workflow
+              run: 
+                cd infrastructure/repository
+                terraform init 
+                terraform apply -auto-approve -var "ecr_name=ephemeral-environment-container-registry" # check this repo name
+
+            - name: dockerize
+              run: |
+                # check the direvory of the app/dockerfile
+                IMAGE_NAME=${{ github.repository }}"_"${{ github.ref_name }}
+                IMAGE_NAME=${IMAGE_NAME//\//_} # replacing / with _ in repository name
+                docker build -f /path/to/Dockerfile -t $IMAGE_NAME . # change path to standard Dockerfile location in thte repo
+
+            - name: push-to-ecr
+              run: |
+                ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text) # Do we hardcode the ACCOUNT_ID, we needed it in a previous step
+                aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+                docker tag $IMAGE_NAME:latest $ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/$IMAGE_NAME:$IMAGE_TAG
+                docker push $ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/$IMAGE_NAME:$IMAGE_TAG
+              env:
+                IMAGE_TAG: ${{ github.sha }}
+
+            - name: check-terraform-format 
+              run: | 
+                REPO_NAME=$(echo $GITHUB_REPOSITORY | cut -d'/' -f2)
+                cd infrastructure && terraform fmt -check -recursive
+
+            - name: plan-and-apply-terraform # how are handlling .tfstate file? terraform workspace? use reponame, branchname, and git sha?
+              run: |  
+                cd infrastructure/deploy 
+                WORKSPACE_NAME=${{ env.TF_ENV }}"_"$REPO_NAME"_"$BRANCH_NAME"_${{ github.sha }} 
+                terraform init -var-file ${{ env.TF_ENV }}.tfvars -var "app_version=${{ github.sha }}" 
+                terraform workspace select $WORKSPACE_NAME || terraform workspace new $WORKSPACE_NAME
+                terraform plan -lock=false 
+                terraform apply -auto-approve
+              env: 
+                BRANCH_NAME: ${{ github.ref_name }}
+                            
+
+            
+# find a way to handle multiple tfstate files --> 40ish microservices * few developers each seperate tfstate file.
+# use environment, repo name, branch name, and git commit sha to create a unique workspace name (is this a good idea?)
+# check if this is a valid workspace name - long name though (tf recommend >= 90 characters)
+# if tsfstate is going to be reused then git sha probably not viable.
