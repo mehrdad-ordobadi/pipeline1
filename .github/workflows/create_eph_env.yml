@@ -1,0 +1,222 @@
+name: Create Ephemeral Environment
+on:
+  repository_dispatch:
+    types: [launch-ephemeral-environment] # can add client payload for inputs etc - can change the type name in the future
+
+env:
+  TF_ENV: "dev"  
+  DOCKERFILE_PATH: /path/to/Dockerfile # change path to standard Dockerfile location in thte repo. Alternatively add path manually on github variables
+
+jobs:
+    verify-branch-name: # in order to not activate workflow for wrong branches at all implement this logic outside of the workflow (windmill/opslevel)
+        runs-on: ubuntu-latest
+        outputs:
+          is_valid: ${{ steps.check_branch_name.outputs.is_valid }}
+        steps:
+            - name: verify-branch-name
+              id: check_branch_name
+              run: |
+                if [[ "${{ github.ref_name }}" =~ ^[A-Z]{3,7}-[0-9]{1,5}$ ]]; then
+                  echo "Branch name is valid."
+                  echo "is_valid=true" >> $GITHUB_OUTPUT
+                else
+                  echo "Invalid branch name. The branch name must correspond to a Jira issue key."
+                  echo "is_valid=false" >> $GITHUB_OUTPUT
+                fi
+
+    create-ephemeral-environment:
+        runs-on: ubuntu-latest
+        needs: verify-branch-name
+        if: ${{ needs.verify-branch-name.outputs.is_valid == 'true' }}
+        steps:
+            - name: git-config
+              run: git config --add --global url."https://oauth2:${GH_TOKEN}@github.com/neurio".insteadOf "https://github.com/neurio"
+
+            - name: checkout-code
+              uses: actions/checkout@v2
+
+            - name: setup-java
+              uses: actions/setup-java@v4
+              with:
+                distribution: 'temurin' # I dont know about this... check if it is the right distribution
+                java-version: '17' # check if this is the right version if more than one is needed, use matrix strategy
+            
+            - name: build-and-test # will probably have to setup java first
+              run: |
+                mvn clean package
+
+            - name: scan-maven-with-sonar-clound
+              run: |
+                  SONAR_PROJECT_KEY=$(echo $GITHUB_REPOSITORY | cut -d'/' -f2)
+                  mvn sonar:sonar \
+                  -Dsonar.token=${{ secrets.SONAR_TOKEN }} \ 
+                  -Dsonar.organization=${{ secrets.SONAR_ORG_KEY}} \ 
+                  -Dsonar.projectKey=$SONAR_PROJECT_KEY \
+                  -Dsonar.host.url=https://sonarcloud.io # SONAR_ORG_KEY is neurio
+                  -Dsonar.projectVersion=${{ github.sha }} 
+              
+              # add sonar quality gate check if we need to make sure the code is up to standard before proceeding
+              # i.e. sonar.qualitygate.wait=true && sonar.qualitygate.timeout=300
+            
+            - name: Configure Aws credentials
+              uses: aws-actions/configure-aws-credentials@v4 #v4 the lastest version
+              with:
+               aws-region: ${{ secrets.AWS_REGION }}
+               role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ secrets.GH_OIDC_IAM_ROLE }} 
+
+            - name: build-image
+              run: |
+                IMAGE_TAG="${{ github.repository }}"_"${{ github.ref_name }}"
+                IMAGE_TAG=${IMAGE_TAG//\//_} # replacing / with _ in repository name
+                echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
+                docker build -f ${{ env.DOCKERFILE_PATH }} -t ${{ secrets.ECR_REPO_NAME }} . || \
+                { echo "Failed to build docker image"; exit 1; }
+            
+            - name: scan-image-with-trivy
+              uses: aquasecurity/trivy-action@master
+              with:
+                image-ref: ${{ secrets.ECR_REPO_NAME }}:latest
+                format: 'json'
+                severity: 'HIGH,CRITICAL,UNKNOWN' # check if this is the right severity level - webhooks might not accept long reports
+                hide-progress: true
+                exit-code: 0 # set to zero for testing purposes
+                output: 'image-report.json' # adjust based on how you want the report to be handled
+            
+            - name: summarize-and-format-trivy-image-scan-results
+              run: |
+                apt update && apt install -y jq
+                apt update && apt install -y jq
+                JSON_TF_PAYLOAD=$(jq -r \
+                    '.Results[] | .Vulnerabilities[] | 
+                    "- Severity: \(.Severity), ID: \(.VulnerabilityID), Package: \(.PkgName)\n"' \
+                    image-report.json | 
+                    jq -Rs \
+                        '{
+                            text: "Trivy Image Scan Summary", 
+                            attachments: [
+                                {
+                                    text: "Scan Summary", 
+                                    fields: [
+                                        {
+                                            title: "Scan Summary", 
+                                            value: ., 
+                                            short: false
+                                        }
+                                    ]
+                                }
+                            ]
+                        }')
+                echo "IMAGE_SCAN_SUMMARY<<EOF" >> $GITHUB_ENV
+                echo "$JSON_TF_PAYLOAD" >> $GITHUB_ENV
+                echo "EOF" >> $GITHUB_ENV
+
+            - name: Send Image Scan Summary to Slack # still need to figure out how to handle the report - this is just a sample
+              env:
+                SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+              uses: slackapi/slack-github-action@v1.25.0
+              with:
+                payload: |
+                    {
+                      "text": "Trivy Docker Image Scan Summary",
+                      "attachments": [
+                        {
+                          "text": "Image Scan Summary",
+                          "fields": [
+                            {
+                              "title": "Image Scan Summary",
+                              "value": "${{ env.IMAGE_SCAN_SUMMARY }}",
+                              "short": false
+                            }
+                          ]
+                        }
+                      ]
+                    }
+           
+            - name: login-to-ecr
+              run: |
+                aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{secrets.AWS_ACCOUNT_ID}}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com \
+                || { echo "Failed to log in to ECR"; exit 1; }
+
+            - name: push-image-to-ecr
+              run: |
+                IMAGE_TAG=${{ env.IMAGE_TAG }}"_"${{ github.sha }}
+                IMAGE_NAME_TAG="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/$${{ secrets.ECR_REPO_NAME }}:${IMAGE_TAG}"
+                docker tag "${{ secrets.ECR_REPO_NAME }}:latest" "$IMAGE_NAME_TAG" || { echo "Failed to tag docker image"; exit 1; }
+                docker push "$IMAGE_NAME_TAG" || { echo "Failed to push docker image"; exit 1;}
+                
+
+            - name: check-terraform-format 
+              run: | 
+                REPO_NAME=$(echo $GITHUB_REPOSITORY | cut -d'/' -f2)
+                cd infrastructure && terraform fmt -check -recursive
+
+            - name: scan-terraform-code-with-trivy
+              uses: aquasecurity/trivy-action@master
+              with: 
+                scan-type: 'config'
+                tf-vars: 'infrastructure/deploy/${{ env.TF_ENV }}.tfvars' 
+                hide-progress: true
+                format: 'json'
+                severity: 'HIGH,CRITICAL,UNKNOWN' # check if this is the right severity level
+                exit-code: 0
+                output: 'terraform-report.json' # adjust based on how you want the report to be handled
+                
+            - name: summarize-and-format-trivy-terraform-scan-results
+              run: |
+                JSON_TF_PAYLOAD=$(jq -r \
+                    '.Results[] | .Misconfigurations[]? | 
+                    "- Severity: \(.Severity), ID: \(.ID), Title: \(.Title)\n"' \
+                    terraform-report.json | 
+                    jq -Rs \
+                        '{
+                            text: "Trivy Terraform Scan Summary", 
+                            attachments: [
+                                {
+                                    text: "Scan Summary", 
+                                    fields: [
+                                        {
+                                            title: "Scan Summary", 
+                                            value: ., 
+                                            short: false
+                                        }
+                                    ]
+                                }
+                            ]
+                        }')
+                echo "TERRAFORM_SCAN_SUMMARY<<EOF" >> $GITHUB_ENV
+                echo "$JSON_TF_PAYLOAD" >> $GITHUB_ENV
+                echo "EOF" >> $GITHUB_ENV
+            
+            - name: send-scan-summary-to-slack # still need to figure out how to handle the report - this is just a sample
+              env:
+                SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+              uses: slackapi/slack-github-action@v1.25.0
+              with:
+                payload: | # may have issues with multiline strings - if so can send it using a curl command instead
+                  {
+                    "text": "Trivy Terraform Scan Summary",
+                    "attachments": [
+                      {
+                        "text": "Scan Summary",
+                        "fields": [
+                          {
+                            "title": "Scan Summary",
+                            "value": "${{ env.TERRAFORM_SCAN_SUMMARY }}",
+                            "short": false
+                          }
+                        ]
+                      }
+                    ]
+                  }
+
+
+            - name: plan-and-apply-terraform # check into this to make sure the correct tfvars is being used + app version
+              run: |  
+                # can use timestamp recorded at trigger time pass as client payload
+                STATE_PATH=$(echo $GITHUB_REPOSITORY | cut -d'/' -f2)/$BRANCH_NAME
+                cd infrastructure/deploy 
+                terraform init -backend-config="key=$STATE_PATH/terraform.tfstate"  || { echo "Failed to initialize Terraform configuration"; exit 1; }
+                terraform plan
+                terraform apply -auto-approve
+              env: 
+                BRANCH_NAME: ${{ github.ref_name }}
